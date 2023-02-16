@@ -136,3 +136,37 @@ class DataSet_read(object):
 
     def __len__(self):
         return len(self.imgList)
+
+class InpaintingDataset(object):
+    def __init__(self, data_path, image_size=128):
+        self.images = self.__load_img(os.path.join(data_path, 'img'), image_size)
+        self.masks = self.__load_img(os.path.join(data_path, 'mask'), image_size)
+
+    def __load_img(self, img_path, image_size):
+        imgList = [f for f in os.listdir(img_path) if any(f.lower().endswith(ext) for ext in IMG_EXTENSIONS)]
+        imgList.sort()
+        #image in (NCHW)
+        images = np.zeros((len(imgList), 3, image_size, image_size)).astype(float)
+        print('Loading dataset: {}'.format(img_path))
+        for i in range(len(imgList)):
+            #cv2 read in images in `HWC` format
+            img = cv2.imread(os.path.join(img_path, imgList[i]))
+            img = cv2.resize(img,(image_size, image_size))
+            #`HWC` to `CHW`
+            img = np.array(img.transpose(2,0,1)).astype(float)
+            max_val = img.max()
+            min_val = img.min()
+            #if 'bad' image encountered
+            if max_val==min_val:
+                images[i]=np.zeros(shape=(3,image_size,image_size)).astype(float)
+                continue
+            img = (img - min_val) / (max_val - min_val) * 2 - 1
+            images[i] = img
+        print('Data loaded, shape: {}'.format(images.shape))
+        return images
+
+    def __getitem__(self, index):
+        return self.images[index], self.masks[index]
+
+    def __len__(self):
+        return len(self.images)

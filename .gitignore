@@ -3,8 +3,7 @@
 .idea
 data/*
 data
-result_images
+result_images*
 checkpoint
-
-
-
+cifar*
+img_*

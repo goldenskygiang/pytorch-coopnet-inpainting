@@ -1,0 +1,1 @@
+python main.py -set cifar-inp -category cifar-missing -img_size 32 -lr_des 0.003 -langevin_step_size_des 0.001 -langevin_step_num_des 10 -sigma_des 0.016 -num_epoch 500 -log_epoch 50 -batch_size 400 -nRow 20 -nCol 20 -data_path . -output_dir ./triples

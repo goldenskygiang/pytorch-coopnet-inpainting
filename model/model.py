@@ -3,13 +3,14 @@ import time
 
 import torchvision
 import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
 import numpy as np
 import math
 
-from model.utils.data_io import DataSet, saveSampleResults
+from model.utils.data_io import DataSet, saveSampleResults, InpaintingDataset
 
 
 class Descriptor(nn.Module):
@@ -126,7 +127,7 @@ class Generator_cifar(nn.Module):
         # self.leakyrelu=nn.LeakyReLU()
         # self.tanh=nn.Tanh()
 
-    def forward(self, z):
+    def forward(self, z, missing_img=None, mask=None):
         self.z = z
 
         # z=z.view(-1,self.opt.z_size)
@@ -144,6 +145,15 @@ class Generator_cifar(nn.Module):
         out = self.leakyrelu(out)
         out = self.convt4(out)
         out = self.tanh(out)
+
+        if missing_img is not None and mask is not None:
+            # print('gen model forward')
+            # print(out.shape)
+            # print(mask.shape)
+            # print(missing_img.shape)
+            out = out * mask
+            out = out + missing_img
+
         return out
 
 
@@ -157,11 +167,11 @@ class CoopNets(nn.Module):
             print('Do Langevin with noise')
         else:
             print('Do Langevin without noise')
-        if opts.set == 'cifar':
+        if opts.set == 'cifar' or opts.set == 'cifar-inp':
             opts.img_size = 32
             print('train on cifar. img_size: {:d}'.format(opts.img_size))
 
-    def langevin_dynamics_generator(self, z, obs):
+    def langevin_dynamics_generator(self, z, obs, mask=None):
         obs = obs.detach()
         criterian = nn.MSELoss(size_average=False, reduce=True)
         for i in range(self.opts.langevin_step_num_gen):
@@ -174,10 +184,11 @@ class CoopNets(nn.Module):
             z = z - 0.5 * self.opts.langevin_step_size_gen * self.opts.langevin_step_size_gen * (z + grad)
             if self.opts.with_noise == True:
                 z += self.opts.langevin_step_size_gen * noise
-
+            if mask is not None:
+                z = z * mask
         return z
 
-    def langevin_dynamics_descriptor(self, x):
+    def langevin_dynamics_descriptor(self, x, mask=None):
         for i in range(self.opts.langevin_step_num_des):
             noise = Variable(torch.randn(self.num_chain, 3, self.opts.img_size, self.opts.img_size).cuda())
             # clone it and turn x into a leaf variable so the grad won't be thrown away
@@ -189,9 +200,13 @@ class CoopNets(nn.Module):
                     (x / self.opts.sigma_des / self.opts.sigma_des - grad)
             if self.opts.with_noise:
                 x += self.opts.langevin_step_size_des * noise
+            if mask is not None:
+                x = x * mask
         return x
 
     def train(self):
+        torch.autograd.set_detect_anomaly(True)
+
         if self.opts.ckpt_des != None and self.opts.ckpt_des != 'None':
             self.descriptor = torch.load(self.opts.ckpt_des)
             print('Loading Descriptor from ' + self.opts.ckpt_des + '...')
@@ -199,7 +214,10 @@ class CoopNets(nn.Module):
             if self.opts.set == 'scene' or self.opts.set == 'lsun':
                 self.descriptor = Descriptor(self.opts).cuda()
                 print('Loading Descriptor without initialization...')
-            elif self.opts.set == 'cifar':
+            elif self.opts.set == 'cifar' or self.opts.set == 'cifar-inp':
+                if self.opts.set == 'cifar-inp':
+                    print('[Inpainting task]')
+                    #self.opts.z_size = 32*32*3
                 self.descriptor = Descriptor_cifar(self.opts).cuda()
                 print('Loading Descriptor_cifar without initialization...')
             else:
@@ -212,7 +230,10 @@ class CoopNets(nn.Module):
             if self.opts.set == 'scene' or self.opts.set == 'lsun':
                 self.generator = Generator(self.opts).cuda()
                 print('Loading Generator without initialization...')
-            elif self.opts.set == 'cifar':
+            elif self.opts.set == 'cifar' or self.opts.set == 'cifar-inp':
+                if self.opts.set == 'cifar-inp':
+                    print('[Inpainting task]')
+                    #self.opts.z_size = 32*32*3
                 self.generator = Generator_cifar(self.opts).cuda()
                 print('Loading Generator_cifar without initialization...')
             else:
@@ -221,6 +242,10 @@ class CoopNets(nn.Module):
         batch_size = self.opts.batch_size
         if self.opts.set == 'scene' or self.opts.set == 'cifar':
             train_data = DataSet(os.path.join(self.opts.data_path, self.opts.category), image_size=self.opts.img_size)
+        elif self.opts.set == 'cifar-inp':
+            train_data = InpaintingDataset(os.path.join(self.opts.data_path, self.opts.category), image_size=self.opts.img_size)
+            #loader = DataLoader(train_data, batch_size=self.num_chain, drop_last=True)
+            #it = iter(loader)
         else:
             train_data = torchvision.datasets.LSUN(root=self.opts.data_path,
                                                    classes=['bedroom_train'],
@@ -248,21 +273,41 @@ class CoopNets(nn.Module):
             for i in range(num_batches):
                 if (i + 1) * batch_size > len(train_data):
                     continue
-                obs_data = train_data[i * batch_size:min((i + 1) * batch_size, len(train_data))]
-                obs_data = Variable(torch.Tensor(obs_data).cuda())  # ,requires_grad=True
+
+                if (self.opts.set == 'cifar-inp'):
+                    obs_data = train_data[i * batch_size:min((i + 1) * batch_size, len(train_data))][0]
+                    mask_data = train_data[i * batch_size:min((i + 1) * batch_size, len(train_data))][1]
+
+                    obs_data = Variable(torch.Tensor(obs_data).cuda())  # ,requires_grad=True
+                    mask_data = Variable(torch.Tensor(mask_data).cuda())
+                    z = torch.randn(batch_size, self.opts.z_size, 1, 1).cuda()
+
+                    # obs_masked = obs_data * mask_data
+                    
+                    # mask_flatten = torch.reshape(mask_data, (batch_size, self.opts.z_size, 1, 1))
+                    # z *= mask_flatten
+                    # obs_flatten = torch.reshape(obs_data, (batch_size, self.opts.z_size, 1, 1))
+                    # z += obs_flatten * (1 - mask_flatten)
+                else:
+                    obs_data = train_data[i * batch_size:min((i + 1) * batch_size, len(train_data))]
+                    obs_data = Variable(torch.Tensor(obs_data).cuda())
+                    z = torch.randn(self.num_chain, self.opts.z_size, 1, 1)
 
                 # G0
-                z = torch.randn(self.num_chain, self.opts.z_size, 1, 1)
                 z = Variable(z.cuda(), requires_grad=True)
-                # NCHW
-                gen_res = self.generator(z)
+
+                if (self.opts.set == 'cifar-inp'):
+                    miss = obs_data * (1 - mask_data)
+                    gen_res = self.generator(z, miss, mask_data)
+                else:
+                    gen_res = self.generator(z)
 
                 # D1
                 if self.opts.langevin_step_num_des > 0:
                     revised = self.langevin_dynamics_descriptor(gen_res)
                 # G1
                 if self.opts.langevin_step_num_gen > 0:
-                    z = self.langevin_dynamics_generator(z, revised)
+                   z = self.langevin_dynamics_generator(z, revised)
 
                 # D2
                 obs_feature = self.descriptor(obs_data)
@@ -299,6 +344,11 @@ class CoopNets(nn.Module):
             except:
                 print('Error when saving obs_data. Skip.')
                 continue
+
+            #obs_missing = obs_data * (1 - mask_data)
+            #revised = revised * mask_data + obs_missing
+            #gen_res = gen_res * mask_data + obs_missing
+
             saveSampleResults(revised.cpu().data, "%s/des_%03d.png" % (self.opts.output_dir, epoch + 1),
                               col_num=self.opts.nCol)
             saveSampleResults(gen_res.cpu().data, "%s/gen_%03d.png" % (self.opts.output_dir, epoch + 1),
